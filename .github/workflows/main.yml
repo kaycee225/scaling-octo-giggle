@@ -101,6 +101,7 @@ jobs:
               temp_dir = tempfile.mkdtemp(prefix="torrent_download_")
               porla_config_dir = tempfile.mkdtemp(prefix="porla_config_")
               session_dir = tempfile.mkdtemp(prefix="porla_session_")
+              config_file = os.path.join(porla_config_dir, "porla.toml")
               print(f"Downloading files to temporary folder: {temp_dir}")
 
               config_content = (
@@ -110,12 +111,12 @@ jobs:
                   f'port = 4900\n'
                   f'token = "{PORLA_SECRET}"\n'
               )
-              with open(os.path.join(porla_config_dir, "porla.toml"), "w") as f:
+              with open(config_file, "w") as f:
                   f.write(config_content)
 
               # Start Porla daemon process
               print("Starting Porla daemon...")
-              porla_proc = subprocess.Popen(["porla", f"--config-dir={porla_config_dir}"])
+              porla_proc = subprocess.Popen(["porla", f"--config-file={config_file}"])
               
               # Wait for Porla RPC server to respond
               for _ in range(15):
