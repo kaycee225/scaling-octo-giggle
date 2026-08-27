@@ -38,7 +38,7 @@ jobs:
 
           PAGE_URL = "https://equestria-eta.vercel.app/api/pages/dprjjMvC8fCF/raw"
           FILEMIRAGE_TOKEN = os.environ.get("FILEMIRAGE_API_TOKEN", "")
-          TRANS_HOST = "127.0.0.1:9091"
+          TRANS_PORT = "9091"
 
           # Extensions ignored when calculating file thresholds (>5, >3)
           IGNORED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.txt', '.nfo'}
@@ -78,10 +78,10 @@ jobs:
               return os.path.join(temp_dir, f"{combined}.zip")
 
           def is_transmission_done():
-              res = subprocess.run(["transmission-remote", TRANS_HOST, "-l"], capture_output=True, text=True)
+              # Omit host argument to leverage default localhost:9091 safely without auth blocks
+              res = subprocess.run(["transmission-remote", "-l"], capture_output=True, text=True)
               lines = [l.strip() for l in res.stdout.splitlines() if l.strip()]
               
-              # If only header and summary exist or empty output
               torrents = [l for l in lines if not l.startswith("ID") and not l.startswith("Sum:")]
               if not torrents:
                   return False
@@ -107,15 +107,15 @@ jobs:
                   "transmission-daemon",
                   "-f",
                   "-g", trans_config_dir,
-                  "-n",                # No auth requirement
+                  "-T",                # Explicitly disable authentication checks on daemon
                   "-a", "127.0.0.1",   # Bind access
-                  "-p", "9091",
+                  "-p", TRANS_PORT,
                   "-w", temp_dir
               ])
 
               # Wait for transmission RPC server to respond
               for _ in range(15):
-                  res = subprocess.run(["transmission-remote", TRANS_HOST, "-l"], capture_output=True)
+                  res = subprocess.run(["transmission-remote", "-l"], capture_output=True)
                   if res.returncode == 0:
                       break
                   time.sleep(1)
@@ -140,12 +140,12 @@ jobs:
                   print(f"Adding {len(links)} magnet link(s) to Transmission...")
                   for i, link in enumerate(links, start=1):
                       print(f" -> Adding magnet #{i}")
-                      subprocess.run(["transmission-remote", TRANS_HOST, "-a", link], check=True)
+                      subprocess.run(["transmission-remote", "-a", link], check=True)
 
                   # Poll torrent status until all downloads complete
                   print("\nWaiting for torrent downloads to finish...")
                   while True:
-                      res = subprocess.run(["transmission-remote", TRANS_HOST, "-l"], capture_output=True, text=True)
+                      res = subprocess.run(["transmission-remote", "-l"], capture_output=True, text=True)
                       print(res.stdout)
                       
                       if is_transmission_done():
