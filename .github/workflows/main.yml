@@ -19,13 +19,10 @@ jobs:
       - name: Install Porla & Dependencies
         run: |
           LATEST_URL=$(curl -s https://api.github.com/repos/porla/porla/releases/latest | grep "browser_download_url.*linux.*amd64" | head -n 1 | cut -d '"' -f 4)
-          if [ -z "$LATEST_URL" ]; then
-            LATEST_URL=$(curl -s https://api.github.com/repos/porla/porla/releases/latest | grep "browser_download_url.*linux.*tar.gz" | head -n 1 | cut -d '"' -f 4)
-          fi
           echo "Downloading Porla from: $LATEST_URL"
-          curl -sL "$LATEST_URL" -o porla.tar.gz
-          tar -xzf porla.tar.gz
-          sudo mv porla /usr/local/bin/
+          curl -sL "$LATEST_URL" -o porla
+          chmod +x porla
+          sudo mv porla /usr/local/bin/porla
           pip3 install requests
 
       - name: Download, Zip Conditions & Upload
