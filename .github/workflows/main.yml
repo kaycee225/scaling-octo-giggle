@@ -1,4 +1,4 @@
-name: Torrent Download & Smart Upload to Filemirage (Magnet2Torrent + Aria2)
+name: Torrent Download & Smart Upload to Filemirage (Transmission)
 
 on:
   push:
@@ -16,11 +16,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Aria2 & Dependencies
+      - name: Install Transmission & Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2
-          pip3 install requests magnet2torrent
+          sudo apt-get install -y transmission-daemon transmission-cli
+          pip3 install requests
 
       - name: Download, Zip Conditions & Upload
         run: |
@@ -30,16 +30,15 @@ jobs:
           import sys
           import time
           import shutil
-          import asyncio
           import zipfile
           import tempfile
           import subprocess
           import urllib.request
           import requests
-          from magnet2torrent import Magnet2Torrent, FailedToFetchException
 
           PAGE_URL = "https://equestria-eta.vercel.app/api/pages/dprjjMvC8fCF/raw"
           FILEMIRAGE_TOKEN = os.environ.get("FILEMIRAGE_API_TOKEN", "")
+          TRANS_PORT = "9091"
 
           # Extensions ignored when calculating file thresholds (>5, >3)
           IGNORED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.txt', '.nfo'}
@@ -78,96 +77,86 @@ jobs:
                   combined = "bundle"
               return os.path.join(temp_dir, f"{combined}.zip")
 
-          async def convert_magnet_to_torrent(magnet_link, output_dir, index):
-              try:
-                  m2t = Magnet2Torrent(magnet_link)
-                  filename, torrent_data = await m2t.retrieve_torrent()
-                  
-                  if not filename.endswith(".torrent"):
-                      filename = f"{filename}.torrent"
-                  
-                  filepath = os.path.join(output_dir, filename)
-                  with open(filepath, "wb") as f:
-                      f.write(torrent_data)
-                  
-                  print(f"   [+] Saved .torrent: {filename}")
-                  return filepath
-              except FailedToFetchException as e:
-                  print(f"   [!] Failed to fetch metadata for link #{index}: {e}")
-              except Exception as e:
-                  print(f"   [!] Error converting link #{index}: {e}")
-              return None
-
-          async def process_magnets(links, torrent_dir):
-              tasks = []
-              for i, link in enumerate(links, start=1):
-                  if link.startswith("magnet:"):
-                      print(f" -> Converting Magnet link #{i} via magnet2torrent...")
-                      tasks.append(convert_magnet_to_torrent(link, torrent_dir, i))
-                  elif link.startswith("http://") or link.startswith("https://"):
-                      print(f" -> Downloading existing .torrent URL #{i}...")
-                      cmd = ["aria2c", f"--dir={torrent_dir}", link]
-                      subprocess.run(cmd, capture_output=True, text=True)
+          def is_transmission_done():
+              res = subprocess.run(["transmission-remote", TRANS_PORT, "-l"], capture_output=True, text=True)
+              lines = [l.strip() for l in res.stdout.splitlines() if l.strip()]
               
-              if tasks:
-                  await asyncio.gather(*tasks)
+              # If only header and summary exist or empty output
+              torrents = [l for l in lines if not l.startswith("ID") and not l.startswith("Sum:")]
+              if not torrents:
+                  return False
+
+              for line in torrents:
+                  match = re.search(r'(\d+)%\s+', line)
+                  if match:
+                      percent = int(match.group(1))
+                      if percent < 100:
+                          return False
+                  else:
+                      return False
+              return True
 
           def main():
+              # 1. Setup paths & launch Transmission Daemon
               temp_dir = tempfile.mkdtemp(prefix="torrent_download_")
-              torrent_dir = tempfile.mkdtemp(prefix="torrent_files_")
-              print(f"Downloading data to: {temp_dir}")
-              print(f"Saving .torrent files to: {torrent_dir}")
+              trans_config_dir = tempfile.mkdtemp(prefix="trans_config_")
+              print(f"Downloading files to temporary folder: {temp_dir}")
 
-              # 1. Fetch magnet links
-              print("Fetching magnet links...")
-              req = urllib.request.Request(PAGE_URL, headers={"User-Agent": "Mozilla/5.0"})
+              print("Starting Transmission Daemon...")
+              trans_proc = subprocess.Popen([
+                  "transmission-daemon",
+                  "-f",
+                  "-g", trans_config_dir,
+                  "-n",                # No auth requirement
+                  "-a", "127.0.0.1",   # Bind access
+                  "-p", TRANS_PORT,
+                  "-w", temp_dir
+              ])
+
+              # Wait for transmission RPC server to respond
+              for _ in range(15):
+                  res = subprocess.run(["transmission-remote", TRANS_PORT, "-l"], capture_output=True)
+                  if res.returncode == 0:
+                      break
+                  time.sleep(1)
+
               try:
-                  with urllib.request.urlopen(req) as response:
-                      lines = response.read().decode("utf-8").splitlines()
-              except Exception as e:
-                  print(f"Failed to fetch page: {e}")
-                  sys.exit(1)
-
-              links = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
-              if not links:
-                  print("No magnet links found.")
-                  return
-
-              # 2. Convert Magnet links to .torrent files using magnet2torrent library
-              print(f"\nProcessing {len(links)} link(s)...")
-              asyncio.run(process_magnets(links, torrent_dir))
-
-              # Locate all created .torrent files
-              torrent_files = []
-              for root, _, files in os.walk(torrent_dir):
-                  for f in files:
-                      if f.endswith(".torrent"):
-                          torrent_files.append(os.path.join(root, f))
-
-              if not torrent_files:
-                  print("Error: No .torrent files were generated or downloaded.")
-                  sys.exit(1)
-
-              print(f"\nSuccessfully collected {len(torrent_files)} .torrent file(s).")
-
-              # 3. Download actual content using Aria2 with the generated .torrent files
-              print("\nStarting download process via Aria2...")
-              for tfile in torrent_files:
-                  print(f" -> Downloading content for: {os.path.basename(tfile)}")
-                  cmd = [
-                      "aria2c",
-                      f"--dir={temp_dir}",
-                      "--seed-time=0",
-                      "--summary-interval=10",
-                      "--max-connection-per-server=16",
-                      tfile
-                  ]
-                  res = subprocess.run(cmd)
-                  if res.returncode != 0:
-                      print(f"   [!] Failed to download content for {tfile}")
+                  # 2. Fetch magnet links
+                  print("Fetching magnet links...")
+                  req = urllib.request.Request(PAGE_URL, headers={"User-Agent": "Mozilla/5.0"})
+                  try:
+                      with urllib.request.urlopen(req) as response:
+                          lines = response.read().decode("utf-8").splitlines()
+                  except Exception as e:
+                      print(f"Failed to fetch page: {e}")
                       sys.exit(1)
 
-              print("\nAll content downloads completed successfully!")
+                  links = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
+                  if not links:
+                      print("No magnet links found.")
+                      return
+
+                  # 3. Add magnet links to Transmission
+                  print(f"Adding {len(links)} magnet link(s) to Transmission...")
+                  for i, link in enumerate(links, start=1):
+                      print(f" -> Adding magnet #{i}")
+                      subprocess.run(["transmission-remote", TRANS_PORT, "-a", link], check=True)
+
+                  # Poll torrent status until all downloads complete
+                  print("\nWaiting for torrent downloads to finish...")
+                  while True:
+                      res = subprocess.run(["transmission-remote", TRANS_PORT, "-l"], capture_output=True, text=True)
+                      print(res.stdout)
+                      
+                      if is_transmission_done():
+                          print("\nAll torrent downloads completed!")
+                          break
+
+                      time.sleep(10)
+
+              finally:
+                  trans_proc.terminate()
+                  trans_proc.wait()
 
               final_upload_files = []
 
