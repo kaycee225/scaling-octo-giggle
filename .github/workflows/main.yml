@@ -1,0 +1,188 @@
+name: Torrent Download & Smart Upload to Pixeldrain (Aria2 + Trackers)
+
+on:
+  push:
+    branches:
+      - New
+  workflow_dispatch:
+
+jobs:
+  torrent-upload:
+    runs-on: ubuntu-latest
+    env:
+      PIXELDRAIN_API_KEY: '1890d8a2-9099-4484-8238-fe667dbfd6bd'
+      FOLDER_PATH: 'downloaded_files'
+      PAGE_URL: 'https://pink-script-snap.lovable.app/api/public/page/3f6bedae-a8af-4284-aa2e-dd7cf32f8e15.txt'
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update && sudo apt install aria2 jq curl python3 -y
+
+      - name: Fetch Trackers & Start Aria2 Daemon
+        run: |
+          mkdir -p "$FOLDER_PATH"
+          
+          # Fetch the best active trackers to bypass GitHub Actions' DHT cold-start delays
+          echo "🌐 Fetching live tracker list..."
+          TRACKERS=$(curl -s https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt | grep -v '^$' | tr '\n' ',' | sed 's/,$//')
+          
+          echo "🚀 Starting Aria2 daemon with injected trackers..."
+          # Start aria2c in the background with RPC enabled and optimized BT settings
+          aria2c --enable-rpc=true \
+                 --rpc-listen-all=false \
+                 --rpc-listen-port=6800 \
+                 --daemon=true \
+                 --dir="$PWD/$FOLDER_PATH" \
+                 --bt-tracker="$TRACKERS" \
+                 --seed-time=0 \
+                 --max-overall-upload-limit=1K \
+                 --bt-max-peers=150 \
+                 --max-connection-per-server=16 \
+                 --summary-interval=0 \
+                 --rpc-allow-origin-all=true
+          
+          sleep 3 # Give daemon a moment to boot
+
+      - name: Dynamic Torrent Fetch & Control (Python RPC)
+        run: |
+          python3 - << 'EOF'
+          import json
+          import urllib.request
+          import os
+          import time
+          import shutil
+
+          save_path = os.environ.get('FOLDER_PATH', 'downloaded_files')
+          url = os.environ.get('PAGE_URL')
+          added_links = set()
+          idle_checks = 0
+
+          def rpc_call(method, params=[]):
+              req = urllib.request.Request('http://localhost:6800/jsonrpc',
+                  data=json.dumps({'jsonrpc': '2.0', 'id': '1', 'method': method, 'params': params}).encode('utf-8'),
+                  headers={'Content-Type': 'application/json'})
+              try:
+                  with urllib.request.urlopen(req, timeout=5) as r:
+                      return json.loads(r.read().decode('utf-8'))['result']
+              except Exception as e:
+                  return None
+
+          print("📡 Connecting to Aria2 RPC & watching for links...")
+
+          while True:
+              # 1. Fetch Control Page
+              try:
+                  req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                  with urllib.request.urlopen(req) as response:
+                      lines = [l.strip() for l in response.read().decode('utf-8').split('\n') if l.strip()]
+              except Exception as e:
+                  print(f"⚠️ Failed to fetch page: {e}")
+                  lines = []
+                  
+              lines_lower = [l.lower() for l in lines]
+              
+              # 2. Global Kill Switch
+              if "STOP.ALL.TORRENTS" in lines:
+                  print("🛑 Global kill switch 'STOP.ALL.TORRENTS' detected! Halting.")
+                  break
+                  
+              # 3. Add New Magnets
+              for line in lines:
+                  if line.startswith("magnet:") and line not in added_links:
+                      print(f"📥 New magnet link detected! Adding to Aria2...")
+                      rpc_call('aria2.addUri', [[line]])
+                      added_links.add(line)
+                      idle_checks = 0 # Reset idle timeout when adding new items
+                      
+              # 4. Process Status & Specific Kill Switches
+              active = rpc_call('aria2.tellActive') or []
+              waiting = rpc_call('aria2.tellWaiting', [0, 100]) or []
+              
+              all_tasks = active + waiting
+              
+              for t in all_tasks:
+                  gid = t.get('gid')
+                  
+                  # Extract name safely. Magnets initially lack names until metadata downloads.
+                  bittorrent_info = t.get('bittorrent', {}).get('info', {})
+                  name = bittorrent_info.get('name')
+                  
+                  if not name and t.get('files') and len(t['files']) > 0:
+                      path = t['files'][0].get('path', '')
+                      if path: name = os.path.basename(path)
+                  
+                  name = name if name else "Resolving Metadata..."
+                  
+                  # Specific Kill Switch
+                  if name != "Resolving Metadata...":
+                      if f"{name.lower()} no" in lines_lower or f"no {name.lower()}" in lines_lower:
+                          print(f"🛑 Specific stop triggered for '{name}'. Removing files...")
+                          rpc_call('aria2.forceRemove', [gid])
+                          
+                          target_path = os.path.join(save_path, name)
+                          if os.path.exists(target_path):
+                              if os.path.isdir(target_path): shutil.rmtree(target_path)
+                              else: os.remove(target_path)
+                          continue
+                  
+                  # Report Progress
+                  total = float(t.get('totalLength', 0))
+                  completed = float(t.get('completedLength', 0))
+                  status = t.get('status', 'unknown')
+                  
+                  if total > 0:
+                      prog = (completed / total) * 100
+                      print(f"📥 Torrent: {name} | Progress: {prog:.1f}% | State: {status}")
+                  else:
+                      print(f"📥 Torrent: {name} | State: {status} (Gathering data...)")
+              
+              # 5. Exit condition: Aria2 handles magnets by dropping them from 'active' briefly 
+              # before spawning the main file download. We use a short idle counter to be safe.
+              if len(all_tasks) == 0 and len(added_links) > 0:
+                  idle_checks += 1
+                  if idle_checks >= 4: # ~40 seconds of zero activity means everything is 100% finished
+                      print("✅ All active downloads completed naturally!")
+                      break
+              else:
+                  idle_checks = 0
+                  
+              time.sleep(10)
+          EOF
+
+      - name: Upload files to Pixeldrain
+        run: |
+          find "$FOLDER_PATH" -type f | sort | while read -r FILE; do
+              # Ignore Aria2 control files and torrent metadata files
+              if [[ "$FILE" == *".aria2" || "$FILE" == *".torrent" ]]; then
+                  continue
+              fi
+
+              FILENAME=$(basename "$FILE")
+              
+              FILE_SIZE_BYTES=$(stat -c%s "$FILE")
+              FILE_SIZE_MB=$(awk "BEGIN {printf \"%.2f\", $FILE_SIZE_BYTES/1024/1024}")
+              
+              echo "Uploading: $FILE ($FILE_SIZE_MB MB)"
+              
+              # Upload via Pixeldrain API with basic auth using the API key
+              RESPONSE=$(curl -s -u ":$PIXELDRAIN_API_KEY" -T "$FILE" "https://pixeldrain.com/api/file/")
+              
+              if echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
+                  success=$(echo "$RESPONSE" | jq -r '.success')
+                  if [ "$success" != "true" ]; then
+                      echo "❌ Failed to upload $FILENAME: $(echo "$RESPONSE" | jq -r '.message')"
+                  else
+                      FILE_ID=$(echo "$RESPONSE" | jq -r '.id')
+                      echo "✅ Successfully uploaded: $FILENAME"
+                      echo "🔗 Download Link: https://pixeldrain.com/u/$FILE_ID"
+                  fi
+              else
+                  echo "❌ Server returned an invalid response (not JSON)."
+                  echo "Raw Server Response:"
+                  echo "$RESPONSE"
+              fi
+          done
