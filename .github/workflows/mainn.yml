@@ -1,0 +1,71 @@
+name: rTorrent & Pixeldrain
+
+on:
+  push:
+    branches: Rtorpixel
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      PIXELDRAIN_API_KEY: 'd5a25155-ac2d-4a93-96fa-1754677248c1'
+      LINK_FETCH_URL: 'https://fhpsbwpqtteuchtgyqlj.supabase.co/functions/v1/page-download/73a53833-5b25-40ee-a849-a66e7cf7d880'
+      KILL_SWITCH_URL: 'https://fhpsbwpqtteuchtgyqlj.supabase.co/functions/v1/page-download/73a53833-5b25-40ee-a849-a66e7cf7d880'
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Dependencies
+        run: sudo apt update && sudo apt install rtorrent screen p7zip-full curl python3-requests -y
+
+      - name: Download, Pack & Upload
+        run: |
+          python3 - << 'EOF'
+          import os, subprocess, time, requests, glob
+          from datetime import datetime
+
+          link_url = os.environ.get("LINK_FETCH_URL")
+          kill_url = os.environ.get("KILL_SWITCH_URL")
+          pd_key = os.environ.get("PIXELDRAIN_API_KEY")
+
+          if kill_url:
+              try:
+                  if "STOP.ALL.TORRENTS" in requests.get(kill_url, timeout=5).text:
+                      print("🛑 Global kill switch activated!")
+                      exit(0)
+              except Exception: pass
+
+          os.makedirs("downloads", exist_ok=True)
+          os.makedirs("session", exist_ok=True)
+
+          with open(".rtorrent.rc", "w") as f:
+              f.write("directory.default.set = downloads\nsession.path.set = session\n")
+
+          subprocess.Popen(["screen", "-d", "-m", "rtorrent"])
+          time.sleep(3)
+
+          update_count = 0
+          while True:
+              update_count += 1
+              timestamp = datetime.now().strftime("%H:%M:%S")
+              files = os.listdir("downloads")
+              
+              print(f"\n" + "="*50)
+              print(f"🔄 [GH-rtorrent-Pixeldrain] Progress Update #{update_count} | {timestamp}")
+              print("-"*50)
+              print(f"📥 Downloaded items count: {len(files)}")
+              print("="*50 + "\n")
+
+              if files and any(os.path.getsize(os.path.join("downloads", f)) > 0 for f in files):
+                  break
+              time.sleep(10)
+
+          subprocess.run(["7z", "a", "-v7000m", "output_archive.7z", "downloads/*"], check=True)
+
+          for archive in sorted(glob.glob("output_archive*")):
+              with open(archive, "rb") as f:
+                  cmd = ["curl", "-s", "-X", "PUT", "-T", archive]
+                  if pd_key: cmd.extend(["-u", f":{pd_key}"])
+                  cmd.append(f"https://pixeldrain.com/api/file/{archive}")
+                  subprocess.run(cmd)
+          EOF
